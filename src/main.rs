@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use axum::{
     Router,
     extract::{
@@ -9,6 +10,7 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
+use bytes::Bytes;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use std::{
@@ -20,13 +22,13 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 use tun::{AbstractDevice, Layer};
 
 type ClientId = u64;
-type Frame = Vec<u8>;
+type Frame = Bytes;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum SessionControl {
@@ -57,7 +59,7 @@ struct ClientHandle {
     mac: Option<MacAddress>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct SwitchTable {
     clients: HashMap<ClientId, ClientHandle>,
     mac_index: HashMap<MacAddress, ClientId>,
@@ -66,7 +68,7 @@ struct SwitchTable {
 struct AppState {
     next_client_id: AtomicU64,
     tap_tx: mpsc::UnboundedSender<Frame>,
-    table: RwLock<SwitchTable>,
+    table: ArcSwap<SwitchTable>,
 }
 
 impl AppState {
@@ -74,7 +76,7 @@ impl AppState {
         Self {
             next_client_id: AtomicU64::new(1),
             tap_tx,
-            table: RwLock::new(SwitchTable::default()),
+            table: ArcSwap::from_pointee(SwitchTable::default()),
         }
     }
 
@@ -82,59 +84,94 @@ impl AppState {
         self.next_client_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    async fn register_client(&self, client_id: ClientId, tx: mpsc::UnboundedSender<Frame>) {
-        let mut table = self.table.write().await;
-        table
-            .clients
-            .insert(client_id, ClientHandle { tx, mac: None });
+    fn register_client(&self, client_id: ClientId, tx: &mpsc::UnboundedSender<Frame>) {
+        self.table.rcu(|table| {
+            let mut next = table.as_ref().clone();
+            next.clients.insert(
+                client_id,
+                ClientHandle {
+                    tx: tx.clone(),
+                    mac: None,
+                },
+            );
+            next
+        });
     }
 
-    async fn unregister_client(&self, client_id: ClientId) {
-        let mut table = self.table.write().await;
-        if let Some(client) = table.clients.remove(&client_id) {
-            if let Some(mac) = client.mac {
-                if table.mac_index.get(&mac) == Some(&client_id) {
-                    table.mac_index.remove(&mac);
-                }
-            }
+    fn unregister_client(&self, client_id: ClientId) {
+        let table = self.table.load();
+        if !table.clients.contains_key(&client_id) {
+            return;
         }
+
+        self.table.rcu(|table| {
+            if !table.clients.contains_key(&client_id) {
+                return table.as_ref().clone();
+            }
+
+            let mut next = table.as_ref().clone();
+            if let Some(mac) = next
+                .clients
+                .remove(&client_id)
+                .and_then(|client| client.mac)
+            {
+                if next.mac_index.get(&mac) == Some(&client_id) {
+                    next.mac_index.remove(&mac);
+                }
+            }
+
+            next
+        });
     }
 
-    async fn learn_mac(&self, client_id: ClientId, mac: MacAddress) -> bool {
-        let mut table = self.table.write().await;
-
-        let previous_mac = match table.clients.get_mut(&client_id) {
-            Some(client) => {
-                if client.mac == Some(mac) {
-                    return false;
-                }
-                client.mac.replace(mac)
-            }
-            None => return false,
+    fn learn_mac(&self, client_id: ClientId, mac: MacAddress) -> bool {
+        let table = self.table.load();
+        let Some(client) = table.clients.get(&client_id) else {
+            return false;
         };
 
-        if let Some(old_mac) = previous_mac {
-            if table.mac_index.get(&old_mac) == Some(&client_id) {
-                table.mac_index.remove(&old_mac);
-            }
+        if client.mac == Some(mac) {
+            return false;
         }
 
-        if let Some(previous_owner) = table.mac_index.insert(mac, client_id) {
-            if previous_owner != client_id {
-                if let Some(previous_client) = table.clients.get_mut(&previous_owner) {
-                    previous_client.mac = None;
+        self.table.rcu(|table| {
+            let Some(client) = table.clients.get(&client_id) else {
+                return table.as_ref().clone();
+            };
+
+            if client.mac == Some(mac) {
+                return table.as_ref().clone();
+            }
+
+            let mut next = table.as_ref().clone();
+
+            let previous_mac = match next.clients.get_mut(&client_id) {
+                Some(client) => client.mac.replace(mac),
+                None => return table.as_ref().clone(),
+            };
+
+            if let Some(old_mac) = previous_mac {
+                if next.mac_index.get(&old_mac) == Some(&client_id) {
+                    next.mac_index.remove(&old_mac);
                 }
             }
-        }
+
+            if let Some(previous_owner) = next.mac_index.insert(mac, client_id) {
+                if previous_owner != client_id {
+                    if let Some(previous_client) = next.clients.get_mut(&previous_owner) {
+                        previous_client.mac = None;
+                    }
+                }
+            }
+
+            next
+        });
 
         true
     }
 
-    async fn sender_for_mac(
-        &self,
-        mac: MacAddress,
-    ) -> Option<(ClientId, mpsc::UnboundedSender<Frame>)> {
-        let table = self.table.read().await;
+    fn sender_for_mac(&self, mac: MacAddress) -> Option<(ClientId, mpsc::UnboundedSender<Frame>)> {
+        let table = self.table.load();
         let client_id = *table.mac_index.get(&mac)?;
         table
             .clients
@@ -142,8 +179,8 @@ impl AppState {
             .map(|client| (client_id, client.tx.clone()))
     }
 
-    async fn all_client_senders(&self) -> Vec<mpsc::UnboundedSender<Frame>> {
-        let table = self.table.read().await;
+    fn all_client_senders(&self) -> Vec<mpsc::UnboundedSender<Frame>> {
+        let table = self.table.load();
         table
             .clients
             .values()
@@ -151,11 +188,11 @@ impl AppState {
             .collect()
     }
 
-    async fn other_client_senders(
+    fn other_client_senders(
         &self,
         excluded_client_id: ClientId,
     ) -> Vec<mpsc::UnboundedSender<Frame>> {
-        let table = self.table.read().await;
+        let table = self.table.load();
         table
             .clients
             .iter()
@@ -264,7 +301,7 @@ fn forwarded_for(headers: &HeaderMap) -> Option<String> {
 async fn client_session(socket: WebSocket, state: Arc<AppState>, peer: String) {
     let client_id = state.next_client_id();
     let (client_tx, mut client_rx) = mpsc::unbounded_channel();
-    state.register_client(client_id, client_tx).await;
+    state.register_client(client_id, &client_tx);
 
     info!(client_id, peer = %peer, "client connected");
 
@@ -272,7 +309,7 @@ async fn client_session(socket: WebSocket, state: Arc<AppState>, peer: String) {
     let peer_for_writer = peer.clone();
     let writer_task = tokio::spawn(async move {
         while let Some(frame) = client_rx.recv().await {
-            if ws_sender.send(Message::Binary(frame.into())).await.is_err() {
+            if ws_sender.send(Message::Binary(frame)).await.is_err() {
                 debug!(client_id, peer = %peer_for_writer, "client writer stopped");
                 break;
             }
@@ -280,48 +317,43 @@ async fn client_session(socket: WebSocket, state: Arc<AppState>, peer: String) {
     });
 
     while let Some(message) = ws_receiver.next().await {
-        if handle_client_message(&state, client_id, message).await == SessionControl::Disconnect {
+        if handle_client_message(&state, client_id, message) == SessionControl::Disconnect {
             break;
         }
     }
 
     writer_task.abort();
-    state.unregister_client(client_id).await;
+    state.unregister_client(client_id);
     info!(client_id, peer = %peer, "client disconnected");
 }
 
-async fn handle_client_message(
+fn handle_client_message(
     state: &AppState,
     client_id: ClientId,
     message: Result<Message, axum::Error>,
 ) -> SessionControl {
     match message {
         Ok(Message::Binary(frame)) => {
-            handle_client_frame(state, client_id, frame.to_vec()).await;
+            handle_client_frame(state, client_id, frame);
             SessionControl::Continue
         }
-        Ok(Message::Close(_)) => SessionControl::Disconnect,
-        Ok(Message::Text(_)) => SessionControl::Continue,
-        Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => SessionControl::Continue,
-        Err(_) => SessionControl::Disconnect,
+        Ok(Message::Close(_)) | Err(_) => SessionControl::Disconnect,
+        Ok(Message::Text(_) | Message::Ping(_) | Message::Pong(_)) => SessionControl::Continue,
     }
 }
 
-async fn handle_client_frame(state: &AppState, client_id: ClientId, frame: Frame) {
-    let (destination, source) = match ethernet_addrs(&frame) {
-        Some(addrs) => addrs,
-        None => {
-            warn!(client_id, "dropping short websocket frame");
-            return;
-        }
+fn handle_client_frame(state: &AppState, client_id: ClientId, frame: Frame) {
+    let Some((destination, source)) = ethernet_addrs(&frame) else {
+        warn!(client_id, "dropping short websocket frame");
+        return;
     };
 
-    if state.learn_mac(client_id, source).await {
+    if state.learn_mac(client_id, source) {
         info!(client_id, mac = %source, "learned client MAC");
     }
 
     if destination.is_broadcast_or_multicast() {
-        let targets = state.other_client_senders(client_id).await;
+        let targets = state.other_client_senders(client_id);
         for target in targets {
             if let Err(error) = target.send(frame.clone()) {
                 debug!(client_id, %error, "failed to queue broadcast frame for client");
@@ -335,7 +367,7 @@ async fn handle_client_frame(state: &AppState, client_id: ClientId, frame: Frame
         return;
     }
 
-    if let Some((target_client_id, target)) = state.sender_for_mac(destination).await {
+    if let Some((target_client_id, target)) = state.sender_for_mac(destination) {
         if target_client_id == client_id {
             debug!(client_id, destination = %destination, "dropping frame addressed back to ingress client");
             return;
@@ -347,7 +379,7 @@ async fn handle_client_frame(state: &AppState, client_id: ClientId, frame: Frame
         return;
     }
 
-    let targets = state.other_client_senders(client_id).await;
+    let targets = state.other_client_senders(client_id);
     for target in targets {
         if let Err(error) = target.send(frame.clone()) {
             debug!(client_id, %error, destination = %destination, "failed to queue flooded frame for client");
@@ -390,14 +422,11 @@ async fn run_tap_task(
     loop {
         tokio::select! {
             outgoing = tap_rx.recv() => {
-                match outgoing {
-                    Some(frame) => {
-                        device.send(&frame).await.context("failed to write frame to TAP")?;
-                    }
-                    None => {
-                        warn!("tap writer channel closed");
-                        return Ok(());
-                    }
+                if let Some(frame) = outgoing {
+                    device.send(frame.as_ref()).await.context("failed to write frame to TAP")?;
+                } else {
+                    warn!("tap writer channel closed");
+                    return Ok(());
                 }
             }
             incoming = device.recv(&mut buffer) => {
@@ -405,20 +434,20 @@ async fn run_tap_task(
                 if size == 0 {
                     continue;
                 }
-                handle_tap_frame(&state, buffer[..size].to_vec()).await;
+                handle_tap_frame(&state, Bytes::copy_from_slice(&buffer[..size]));
             }
         }
     }
 }
 
-async fn handle_tap_frame(state: &AppState, frame: Frame) {
+fn handle_tap_frame(state: &AppState, frame: Frame) {
     let Some((destination, _source)) = ethernet_addrs(&frame) else {
         warn!("dropping short TAP frame");
         return;
     };
 
     if destination.is_broadcast_or_multicast() {
-        let targets = state.all_client_senders().await;
+        let targets = state.all_client_senders();
         for target in targets {
             if let Err(error) = target.send(frame.clone()) {
                 debug!(%error, "failed to queue TAP broadcast frame for client");
@@ -427,7 +456,7 @@ async fn handle_tap_frame(state: &AppState, frame: Frame) {
         return;
     }
 
-    if let Some((_client_id, target)) = state.sender_for_mac(destination).await {
+    if let Some((_client_id, target)) = state.sender_for_mac(destination) {
         if let Err(error) = target.send(frame) {
             debug!(
                 destination = %destination,
@@ -438,7 +467,7 @@ async fn handle_tap_frame(state: &AppState, frame: Frame) {
         return;
     }
 
-    let targets = state.all_client_senders().await;
+    let targets = state.all_client_senders();
     for target in targets {
         if let Err(error) = target.send(frame.clone()) {
             debug!(
@@ -455,8 +484,10 @@ fn ethernet_addrs(frame: &[u8]) -> Option<(MacAddress, MacAddress)> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::{AppState, MacAddress, ethernet_addrs, handle_client_frame, handle_tap_frame};
+    use bytes::Bytes;
     use tokio::sync::mpsc::{self, error::TryRecvError};
 
     #[test]
@@ -488,11 +519,11 @@ mod tests {
 
         let (client_one_tx, mut client_one_rx) = mpsc::unbounded_channel();
         let (client_two_tx, mut client_two_rx) = mpsc::unbounded_channel();
-        state.register_client(1, client_one_tx).await;
-        state.register_client(2, client_two_tx).await;
+        state.register_client(1, &client_one_tx);
+        state.register_client(2, &client_two_tx);
 
         let frame = ethernet_frame([0xff; 6], [0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
-        handle_client_frame(&state, 1, frame.clone()).await;
+        handle_client_frame(&state, 1, frame.clone());
 
         assert_eq!(client_two_rx.try_recv().expect("other client frame"), frame);
         assert!(matches!(client_one_rx.try_recv(), Err(TryRecvError::Empty)));
@@ -506,14 +537,14 @@ mod tests {
 
         let (client_one_tx, mut client_one_rx) = mpsc::unbounded_channel();
         let (client_two_tx, mut client_two_rx) = mpsc::unbounded_channel();
-        state.register_client(1, client_one_tx).await;
-        state.register_client(2, client_two_tx).await;
+        state.register_client(1, &client_one_tx);
+        state.register_client(2, &client_two_tx);
 
         let frame = ethernet_frame(
             [0x02, 0x00, 0x00, 0x00, 0x00, 0x22],
             [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
         );
-        handle_client_frame(&state, 1, frame.clone()).await;
+        handle_client_frame(&state, 1, frame.clone());
 
         assert_eq!(client_two_rx.try_recv().expect("other client frame"), frame);
         assert!(matches!(client_one_rx.try_recv(), Err(TryRecvError::Empty)));
@@ -527,14 +558,14 @@ mod tests {
 
         let (client_one_tx, mut client_one_rx) = mpsc::unbounded_channel();
         let (client_two_tx, mut client_two_rx) = mpsc::unbounded_channel();
-        state.register_client(1, client_one_tx).await;
-        state.register_client(2, client_two_tx).await;
+        state.register_client(1, &client_one_tx);
+        state.register_client(2, &client_two_tx);
 
         let frame = ethernet_frame(
             [0x02, 0x00, 0x00, 0x00, 0x00, 0x99],
             [0x02, 0x00, 0x00, 0x00, 0x00, 0xaa],
         );
-        handle_tap_frame(&state, frame.clone()).await;
+        handle_tap_frame(&state, frame.clone());
 
         assert_eq!(client_one_rx.try_recv().expect("first client frame"), frame);
         assert_eq!(
@@ -543,11 +574,27 @@ mod tests {
         );
     }
 
-    fn ethernet_frame(destination: [u8; 6], source: [u8; 6]) -> Vec<u8> {
+    #[tokio::test]
+    async fn learning_same_mac_twice_is_a_noop() {
+        let (tap_tx, _tap_rx) = mpsc::unbounded_channel();
+        let state = AppState::new(tap_tx);
+
+        let (client_tx, _client_rx) = mpsc::unbounded_channel();
+        state.register_client(1, &client_tx);
+
+        let mac = MacAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        assert!(state.learn_mac(1, mac));
+        assert!(!state.learn_mac(1, mac));
+
+        let (client_id, _sender) = state.sender_for_mac(mac).expect("mac mapping");
+        assert_eq!(client_id, 1);
+    }
+
+    fn ethernet_frame(destination: [u8; 6], source: [u8; 6]) -> Bytes {
         let mut frame = Vec::with_capacity(14);
         frame.extend_from_slice(&destination);
         frame.extend_from_slice(&source);
         frame.extend_from_slice(&[0x08, 0x00]);
-        frame
+        Bytes::from(frame)
     }
 }
