@@ -28,6 +28,12 @@ use tun::{AbstractDevice, Layer};
 type ClientId = u64;
 type Frame = Vec<u8>;
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SessionControl {
+    Continue,
+    Disconnect,
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     author,
@@ -274,25 +280,31 @@ async fn client_session(socket: WebSocket, state: Arc<AppState>, peer: String) {
     });
 
     while let Some(message) = ws_receiver.next().await {
-        match message {
-            Ok(Message::Binary(frame)) => {
-                handle_client_frame(&state, client_id, frame.to_vec()).await;
-            }
-            Ok(Message::Close(_)) => break,
-            Ok(Message::Text(_)) => {
-                debug!(client_id, peer = %peer, "ignoring text frame");
-            }
-            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
-            Err(error) => {
-                warn!(client_id, peer = %peer, %error, "websocket receive error");
-                break;
-            }
+        if handle_client_message(&state, client_id, message).await == SessionControl::Disconnect {
+            break;
         }
     }
 
     writer_task.abort();
     state.unregister_client(client_id).await;
     info!(client_id, peer = %peer, "client disconnected");
+}
+
+async fn handle_client_message(
+    state: &AppState,
+    client_id: ClientId,
+    message: Result<Message, axum::Error>,
+) -> SessionControl {
+    match message {
+        Ok(Message::Binary(frame)) => {
+            handle_client_frame(state, client_id, frame.to_vec()).await;
+            SessionControl::Continue
+        }
+        Ok(Message::Close(_)) => SessionControl::Disconnect,
+        Ok(Message::Text(_)) => SessionControl::Continue,
+        Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => SessionControl::Continue,
+        Err(_) => SessionControl::Disconnect,
+    }
 }
 
 async fn handle_client_frame(state: &AppState, client_id: ClientId, frame: Frame) {
