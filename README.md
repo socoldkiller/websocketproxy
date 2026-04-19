@@ -33,6 +33,18 @@ sudo RUST_LOG=info cargo run --release -- \
 
 The WebSocket endpoint is exposed at `/`.
 
+## Bridge helper
+
+The `scripts/bridge-tap.sh` helper manages a Linux bridge between the uplink interface and the TAP device.
+
+```bash
+sudo ./scripts/bridge-tap.sh
+./scripts/bridge-tap.sh status
+./scripts/bridge-tap.sh down
+```
+
+The server also exposes `GET /traffic`, which returns JSON traffic stats including total bytes and a recent throughput sample.
+
 ## Configuration
 
 | Flag | Environment variable | Default |

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use axum::{
-    Router,
+    Json, Router,
     extract::{
         ConnectInfo, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -13,14 +13,17 @@ use axum::{
 use bytes::Bytes;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
+use serde::Serialize;
 use std::{
     collections::HashMap,
+    convert::TryFrom,
     fmt,
     net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Instant,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -29,6 +32,11 @@ use tun::{AbstractDevice, Layer};
 
 type ClientId = u64;
 type Frame = Bytes;
+
+const CLIENT_OUTBOUND_QUEUE_CAPACITY: usize = 128;
+const CLIENT_OUTBOUND_DRAIN_BATCH_SIZE: usize = 32;
+const TRAFFIC_RECENT_WINDOW_SECS: u64 = 5;
+const TRAFFIC_RECENT_WINDOW_SIZE: usize = 5;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum SessionControl {
@@ -53,9 +61,280 @@ struct Cli {
     tap_mtu: u16,
 }
 
+#[derive(Serialize)]
+struct TrafficSnapshot {
+    uptime_seconds: u64,
+    recent_window_seconds: u64,
+    connected_clients: usize,
+    websocket_rx: DirectionSnapshot,
+    websocket_tx: DirectionSnapshot,
+    tap_rx: DirectionSnapshot,
+    tap_tx: DirectionSnapshot,
+    current_bps: u64,
+}
+
+#[derive(Serialize)]
+struct DirectionSnapshot {
+    frames: u64,
+    bytes: u64,
+    recent_frames: u64,
+    recent_bytes: u64,
+    recent_bps: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DirectionTotals {
+    frames: u64,
+    bytes: u64,
+}
+
+impl DirectionTotals {
+    const fn saturating_sub(self, older: Self) -> Self {
+        Self {
+            frames: self.frames.saturating_sub(older.frames),
+            bytes: self.bytes.saturating_sub(older.bytes),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct TrafficTotals {
+    websocket_rx: DirectionTotals,
+    websocket_tx: DirectionTotals,
+    tap_rx: DirectionTotals,
+    tap_tx: DirectionTotals,
+}
+
+impl TrafficTotals {
+    const fn saturating_sub(self, older: Self) -> Self {
+        Self {
+            websocket_rx: self.websocket_rx.saturating_sub(older.websocket_rx),
+            websocket_tx: self.websocket_tx.saturating_sub(older.websocket_tx),
+            tap_rx: self.tap_rx.saturating_sub(older.tap_rx),
+            tap_tx: self.tap_tx.saturating_sub(older.tap_tx),
+        }
+    }
+
+    const fn total_bytes(self) -> u64 {
+        self.websocket_rx
+            .bytes
+            .saturating_add(self.websocket_tx.bytes)
+            .saturating_add(self.tap_rx.bytes)
+            .saturating_add(self.tap_tx.bytes)
+    }
+}
+
+struct DirectionCounter {
+    frames: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl DirectionCounter {
+    const fn new() -> Self {
+        Self {
+            frames: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, frames: u64, bytes: u64) {
+        self.frames.fetch_add(frames, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> DirectionTotals {
+        DirectionTotals {
+            frames: self.frames.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+// Hot path only increments atomics; a background task samples these once per second.
+struct TrafficCounters {
+    websocket_rx: DirectionCounter,
+    websocket_tx: DirectionCounter,
+    tap_rx: DirectionCounter,
+    tap_tx: DirectionCounter,
+}
+
+impl TrafficCounters {
+    const fn new() -> Self {
+        Self {
+            websocket_rx: DirectionCounter::new(),
+            websocket_tx: DirectionCounter::new(),
+            tap_rx: DirectionCounter::new(),
+            tap_tx: DirectionCounter::new(),
+        }
+    }
+
+    fn record_websocket_rx(&self, bytes: usize) {
+        self.websocket_rx.record(1, saturating_usize_to_u64(bytes));
+    }
+
+    fn record_websocket_tx_batch(&self, frames: u64, bytes: u64) {
+        self.websocket_tx.record(frames, bytes);
+    }
+
+    fn record_tap_rx(&self, bytes: usize) {
+        self.tap_rx.record(1, saturating_usize_to_u64(bytes));
+    }
+
+    fn record_tap_tx(&self, bytes: usize) {
+        self.tap_tx.record(1, saturating_usize_to_u64(bytes));
+    }
+
+    fn snapshot(&self) -> TrafficTotals {
+        TrafficTotals {
+            websocket_rx: self.websocket_rx.snapshot(),
+            websocket_tx: self.websocket_tx.snapshot(),
+            tap_rx: self.tap_rx.snapshot(),
+            tap_tx: self.tap_tx.snapshot(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct TrafficSample {
+    second: u64,
+    totals: TrafficTotals,
+}
+
+struct TrafficHistory {
+    samples: [TrafficSample; TRAFFIC_RECENT_WINDOW_SIZE + 1],
+}
+
+impl TrafficHistory {
+    fn new() -> Self {
+        Self {
+            samples: [TrafficSample::default(); TRAFFIC_RECENT_WINDOW_SIZE + 1],
+        }
+    }
+
+    fn record(&mut self, second: u64, totals: TrafficTotals) {
+        let slot = usize::try_from(second).unwrap_or(usize::MAX) % self.samples.len();
+        self.samples[slot] = TrafficSample { second, totals };
+    }
+
+    fn baseline(&self, target_second: u64) -> TrafficTotals {
+        let mut best_second = 0_u64;
+        let mut best_totals = TrafficTotals::default();
+
+        for sample in &self.samples {
+            let sample = *sample;
+            if sample.second <= target_second && sample.second >= best_second {
+                best_second = sample.second;
+                best_totals = sample.totals;
+            }
+        }
+
+        best_totals
+    }
+}
+
+struct TrafficStats {
+    started_at: Instant,
+    counters: TrafficCounters,
+    history: std::sync::Mutex<TrafficHistory>,
+}
+
+impl TrafficStats {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            counters: TrafficCounters::new(),
+            history: std::sync::Mutex::new(TrafficHistory::new()),
+        }
+    }
+
+    fn record_websocket_rx(&self, bytes: usize) {
+        self.counters.record_websocket_rx(bytes);
+    }
+
+    fn record_websocket_tx_batch(&self, frames: u64, bytes: u64) {
+        self.counters.record_websocket_tx_batch(frames, bytes);
+    }
+
+    fn record_tap_rx(&self, bytes: usize) {
+        self.counters.record_tap_rx(bytes);
+    }
+
+    fn record_tap_tx(&self, bytes: usize) {
+        self.counters.record_tap_tx(bytes);
+    }
+
+    fn sample(&self) {
+        self.sample_at(self.elapsed_seconds());
+    }
+
+    fn sample_at(&self, second: u64) {
+        let totals = self.counters.snapshot();
+        self.history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(second, totals);
+    }
+
+    fn snapshot(&self, connected_clients: usize) -> TrafficSnapshot {
+        self.snapshot_at(self.elapsed_seconds(), connected_clients)
+    }
+
+    fn snapshot_at(&self, second: u64, connected_clients: usize) -> TrafficSnapshot {
+        let recent_window_seconds = second.clamp(1, TRAFFIC_RECENT_WINDOW_SECS);
+        let current = self.counters.snapshot();
+        let baseline_second = second.saturating_sub(recent_window_seconds);
+        let baseline = self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .baseline(baseline_second);
+        let recent = current.saturating_sub(baseline);
+        let current_bps = recent.total_bytes() / recent_window_seconds;
+
+        TrafficSnapshot {
+            uptime_seconds: second,
+            recent_window_seconds,
+            connected_clients,
+            websocket_rx: DirectionSnapshot {
+                frames: current.websocket_rx.frames,
+                bytes: current.websocket_rx.bytes,
+                recent_frames: recent.websocket_rx.frames,
+                recent_bytes: recent.websocket_rx.bytes,
+                recent_bps: recent.websocket_rx.bytes / recent_window_seconds,
+            },
+            websocket_tx: DirectionSnapshot {
+                frames: current.websocket_tx.frames,
+                bytes: current.websocket_tx.bytes,
+                recent_frames: recent.websocket_tx.frames,
+                recent_bytes: recent.websocket_tx.bytes,
+                recent_bps: recent.websocket_tx.bytes / recent_window_seconds,
+            },
+            tap_rx: DirectionSnapshot {
+                frames: current.tap_rx.frames,
+                bytes: current.tap_rx.bytes,
+                recent_frames: recent.tap_rx.frames,
+                recent_bytes: recent.tap_rx.bytes,
+                recent_bps: recent.tap_rx.bytes / recent_window_seconds,
+            },
+            tap_tx: DirectionSnapshot {
+                frames: current.tap_tx.frames,
+                bytes: current.tap_tx.bytes,
+                recent_frames: recent.tap_tx.frames,
+                recent_bytes: recent.tap_tx.bytes,
+                recent_bps: recent.tap_tx.bytes / recent_window_seconds,
+            },
+            current_bps,
+        }
+    }
+
+    fn elapsed_seconds(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
+    }
+}
+
 #[derive(Clone)]
 struct ClientHandle {
-    tx: mpsc::UnboundedSender<Frame>,
+    tx: mpsc::Sender<Frame>,
     mac: Option<MacAddress>,
 }
 
@@ -68,6 +347,7 @@ struct SwitchTable {
 struct AppState {
     next_client_id: AtomicU64,
     tap_tx: mpsc::UnboundedSender<Frame>,
+    traffic: TrafficStats,
     table: ArcSwap<SwitchTable>,
 }
 
@@ -76,6 +356,7 @@ impl AppState {
         Self {
             next_client_id: AtomicU64::new(1),
             tap_tx,
+            traffic: TrafficStats::new(),
             table: ArcSwap::from_pointee(SwitchTable::default()),
         }
     }
@@ -84,7 +365,11 @@ impl AppState {
         self.next_client_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn register_client(&self, client_id: ClientId, tx: &mpsc::UnboundedSender<Frame>) {
+    fn client_count(&self) -> usize {
+        self.table.load().clients.len()
+    }
+
+    fn register_client(&self, client_id: ClientId, tx: &mpsc::Sender<Frame>) {
         self.table.rcu(|table| {
             let mut next = table.as_ref().clone();
             next.clients.insert(
@@ -96,6 +381,30 @@ impl AppState {
             );
             next
         });
+    }
+
+    fn record_websocket_rx(&self, bytes: usize) {
+        self.traffic.record_websocket_rx(bytes);
+    }
+
+    fn record_websocket_tx_batch(&self, frames: u64, bytes: u64) {
+        self.traffic.record_websocket_tx_batch(frames, bytes);
+    }
+
+    fn record_tap_rx(&self, bytes: usize) {
+        self.traffic.record_tap_rx(bytes);
+    }
+
+    fn record_tap_tx(&self, bytes: usize) {
+        self.traffic.record_tap_tx(bytes);
+    }
+
+    fn traffic_sample(&self) {
+        self.traffic.sample();
+    }
+
+    fn traffic_snapshot(&self) -> TrafficSnapshot {
+        self.traffic.snapshot(self.client_count())
     }
 
     fn unregister_client(&self, client_id: ClientId) {
@@ -170,7 +479,7 @@ impl AppState {
         true
     }
 
-    fn sender_for_mac(&self, mac: MacAddress) -> Option<(ClientId, mpsc::UnboundedSender<Frame>)> {
+    fn sender_for_mac(&self, mac: MacAddress) -> Option<(ClientId, mpsc::Sender<Frame>)> {
         let table = self.table.load();
         let client_id = *table.mac_index.get(&mac)?;
         table
@@ -179,31 +488,13 @@ impl AppState {
             .map(|client| (client_id, client.tx.clone()))
     }
 
-    fn all_client_senders(&self) -> Vec<mpsc::UnboundedSender<Frame>> {
-        let table = self.table.load();
-        table
-            .clients
-            .values()
-            .map(|client| client.tx.clone())
-            .collect()
-    }
-
-    fn other_client_senders(
-        &self,
-        excluded_client_id: ClientId,
-    ) -> Vec<mpsc::UnboundedSender<Frame>> {
-        let table = self.table.load();
-        table
-            .clients
-            .iter()
-            .filter(|(client_id, _client)| **client_id != excluded_client_id)
-            .map(|(_client_id, client)| client.tx.clone())
-            .collect()
-    }
-
     fn send_to_tap(&self, frame: Frame) -> Result<(), mpsc::error::SendError<Frame>> {
         self.tap_tx.send(frame)
     }
+}
+
+fn saturating_usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
@@ -251,8 +542,12 @@ async fn main() -> Result<()> {
     let tap_cli = cli.clone();
     let tap_task = tokio::spawn(async move { run_tap_task(tap_cli, tap_state, tap_rx).await });
 
+    let traffic_state = Arc::clone(&state);
+    let _traffic_task = tokio::spawn(async move { run_traffic_task(traffic_state).await });
+
     let app = Router::new()
         .route("/", get(ws_handler))
+        .route("/traffic", get(traffic_handler))
         .with_state(Arc::clone(&state));
 
     let listener = tokio::net::TcpListener::bind(cli.listen_addr)
@@ -288,6 +583,20 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| client_session(socket, state, peer))
 }
 
+async fn traffic_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(state.traffic_snapshot())
+}
+
+async fn run_traffic_task(state: Arc<AppState>) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        interval.tick().await;
+        state.traffic_sample();
+    }
+}
+
 fn forwarded_for(headers: &HeaderMap) -> Option<String> {
     headers
         .get("x-forwarded-for")
@@ -300,18 +609,48 @@ fn forwarded_for(headers: &HeaderMap) -> Option<String> {
 
 async fn client_session(socket: WebSocket, state: Arc<AppState>, peer: String) {
     let client_id = state.next_client_id();
-    let (client_tx, mut client_rx) = mpsc::unbounded_channel();
+    let (client_tx, mut client_rx) = mpsc::channel(CLIENT_OUTBOUND_QUEUE_CAPACITY);
     state.register_client(client_id, &client_tx);
 
     info!(client_id, peer = %peer, "client connected");
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let peer_for_writer = peer.clone();
+    let writer_state = Arc::clone(&state);
     let writer_task = tokio::spawn(async move {
+        let mut batch = Vec::with_capacity(CLIENT_OUTBOUND_DRAIN_BATCH_SIZE);
+
         while let Some(frame) = client_rx.recv().await {
-            if ws_sender.send(Message::Binary(frame)).await.is_err() {
-                debug!(client_id, peer = %peer_for_writer, "client writer stopped");
-                break;
+            batch.clear();
+            batch.push(frame);
+
+            while batch.len() < CLIENT_OUTBOUND_DRAIN_BATCH_SIZE {
+                match client_rx.try_recv() {
+                    Ok(frame) => batch.push(frame),
+                    Err(
+                        mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected,
+                    ) => break,
+                }
+            }
+
+            let mut sent_frames = 0_u64;
+            let mut sent_bytes = 0_u64;
+
+            for frame in batch.split_off(0) {
+                let frame_len = frame.len();
+                if ws_sender.send(Message::Binary(frame)).await.is_err() {
+                    if sent_frames > 0 {
+                        writer_state.record_websocket_tx_batch(sent_frames, sent_bytes);
+                    }
+                    debug!(client_id, peer = %peer_for_writer, "client writer stopped");
+                    return;
+                }
+                sent_frames = sent_frames.saturating_add(1);
+                sent_bytes = sent_bytes.saturating_add(saturating_usize_to_u64(frame_len));
+            }
+
+            if sent_frames > 0 {
+                writer_state.record_websocket_tx_batch(sent_frames, sent_bytes);
             }
         }
     });
@@ -334,6 +673,7 @@ fn handle_client_message(
 ) -> SessionControl {
     match message {
         Ok(Message::Binary(frame)) => {
+            state.record_websocket_rx(frame.len());
             handle_client_frame(state, client_id, frame);
             SessionControl::Continue
         }
@@ -353,10 +693,19 @@ fn handle_client_frame(state: &AppState, client_id: ClientId, frame: Frame) {
     }
 
     if destination.is_broadcast_or_multicast() {
-        let targets = state.other_client_senders(client_id);
-        for target in targets {
-            if let Err(error) = target.send(frame.clone()) {
-                debug!(client_id, %error, "failed to queue broadcast frame for client");
+        let table = state.table.load();
+        for (target_client_id, target) in &table.clients {
+            if *target_client_id == client_id {
+                continue;
+            }
+
+            if let Err(error) = target.tx.try_send(frame.clone()) {
+                debug!(
+                    client_id,
+                    target_client_id = *target_client_id,
+                    %error,
+                    "failed to queue broadcast frame for client"
+                );
             }
         }
 
@@ -373,16 +722,26 @@ fn handle_client_frame(state: &AppState, client_id: ClientId, frame: Frame) {
             return;
         }
 
-        if let Err(error) = target.send(frame) {
+        if let Err(error) = target.try_send(frame) {
             debug!(client_id, %error, destination = %destination, "failed to queue unicast frame for client");
         }
         return;
     }
 
-    let targets = state.other_client_senders(client_id);
-    for target in targets {
-        if let Err(error) = target.send(frame.clone()) {
-            debug!(client_id, %error, destination = %destination, "failed to queue flooded frame for client");
+    let table = state.table.load();
+    for (target_client_id, target) in &table.clients {
+        if *target_client_id == client_id {
+            continue;
+        }
+
+        if let Err(error) = target.tx.try_send(frame.clone()) {
+            debug!(
+                client_id,
+                target_client_id = *target_client_id,
+                %error,
+                destination = %destination,
+                "failed to queue flooded frame for client"
+            );
         }
     }
 
@@ -423,7 +782,9 @@ async fn run_tap_task(
         tokio::select! {
             outgoing = tap_rx.recv() => {
                 if let Some(frame) = outgoing {
+                    let frame_len = frame.len();
                     device.send(frame.as_ref()).await.context("failed to write frame to TAP")?;
+                    state.record_tap_tx(frame_len);
                 } else {
                     warn!("tap writer channel closed");
                     return Ok(());
@@ -434,6 +795,7 @@ async fn run_tap_task(
                 if size == 0 {
                     continue;
                 }
+                state.record_tap_rx(size);
                 handle_tap_frame(&state, Bytes::copy_from_slice(&buffer[..size]));
             }
         }
@@ -447,17 +809,21 @@ fn handle_tap_frame(state: &AppState, frame: Frame) {
     };
 
     if destination.is_broadcast_or_multicast() {
-        let targets = state.all_client_senders();
-        for target in targets {
-            if let Err(error) = target.send(frame.clone()) {
-                debug!(%error, "failed to queue TAP broadcast frame for client");
+        let table = state.table.load();
+        for (client_id, target) in &table.clients {
+            if let Err(error) = target.tx.try_send(frame.clone()) {
+                debug!(
+                    client_id = *client_id,
+                    %error,
+                    "failed to queue TAP broadcast frame for client"
+                );
             }
         }
         return;
     }
 
     if let Some((_client_id, target)) = state.sender_for_mac(destination) {
-        if let Err(error) = target.send(frame) {
+        if let Err(error) = target.try_send(frame) {
             debug!(
                 destination = %destination,
                 %error,
@@ -467,10 +833,11 @@ fn handle_tap_frame(state: &AppState, frame: Frame) {
         return;
     }
 
-    let targets = state.all_client_senders();
-    for target in targets {
-        if let Err(error) = target.send(frame.clone()) {
+    let table = state.table.load();
+    for (client_id, target) in &table.clients {
+        if let Err(error) = target.tx.try_send(frame.clone()) {
             debug!(
+                client_id = *client_id,
                 destination = %destination,
                 %error,
                 "failed to queue flooded TAP frame for client"
@@ -486,7 +853,9 @@ fn ethernet_addrs(frame: &[u8]) -> Option<(MacAddress, MacAddress)> {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::{AppState, MacAddress, ethernet_addrs, handle_client_frame, handle_tap_frame};
+    use super::{
+        AppState, MacAddress, TrafficStats, ethernet_addrs, handle_client_frame, handle_tap_frame,
+    };
     use bytes::Bytes;
     use tokio::sync::mpsc::{self, error::TryRecvError};
 
@@ -512,13 +881,41 @@ mod tests {
         assert!(!unicast.is_broadcast_or_multicast());
     }
 
+    #[test]
+    fn traffic_stats_snapshot_uses_background_samples() {
+        let stats = TrafficStats::new();
+
+        stats.record_websocket_rx(100);
+        stats.record_websocket_tx_batch(2, 40);
+        stats.record_tap_rx(10);
+        stats.sample_at(1);
+
+        stats.record_websocket_rx(50);
+        stats.record_tap_tx(25);
+        stats.sample_at(6);
+
+        let snapshot = stats.snapshot_at(6, 3);
+        assert_eq!(snapshot.uptime_seconds, 6);
+        assert_eq!(snapshot.recent_window_seconds, 5);
+        assert_eq!(snapshot.connected_clients, 3);
+        assert_eq!(snapshot.websocket_rx.frames, 2);
+        assert_eq!(snapshot.websocket_rx.bytes, 150);
+        assert_eq!(snapshot.websocket_rx.recent_frames, 1);
+        assert_eq!(snapshot.websocket_rx.recent_bytes, 50);
+        assert_eq!(snapshot.websocket_tx.frames, 2);
+        assert_eq!(snapshot.websocket_tx.recent_bytes, 0);
+        assert_eq!(snapshot.tap_rx.bytes, 10);
+        assert_eq!(snapshot.tap_tx.recent_bytes, 25);
+        assert_eq!(snapshot.current_bps, 15);
+    }
+
     #[tokio::test]
     async fn client_broadcast_floods_to_other_clients_and_tap_without_echo() {
         let (tap_tx, mut tap_rx) = mpsc::unbounded_channel();
         let state = AppState::new(tap_tx);
 
-        let (client_one_tx, mut client_one_rx) = mpsc::unbounded_channel();
-        let (client_two_tx, mut client_two_rx) = mpsc::unbounded_channel();
+        let (client_one_tx, mut client_one_rx) = mpsc::channel(1);
+        let (client_two_tx, mut client_two_rx) = mpsc::channel(1);
         state.register_client(1, &client_one_tx);
         state.register_client(2, &client_two_tx);
 
@@ -535,8 +932,8 @@ mod tests {
         let (tap_tx, mut tap_rx) = mpsc::unbounded_channel();
         let state = AppState::new(tap_tx);
 
-        let (client_one_tx, mut client_one_rx) = mpsc::unbounded_channel();
-        let (client_two_tx, mut client_two_rx) = mpsc::unbounded_channel();
+        let (client_one_tx, mut client_one_rx) = mpsc::channel(1);
+        let (client_two_tx, mut client_two_rx) = mpsc::channel(1);
         state.register_client(1, &client_one_tx);
         state.register_client(2, &client_two_tx);
 
@@ -556,8 +953,8 @@ mod tests {
         let (tap_tx, _tap_rx) = mpsc::unbounded_channel();
         let state = AppState::new(tap_tx);
 
-        let (client_one_tx, mut client_one_rx) = mpsc::unbounded_channel();
-        let (client_two_tx, mut client_two_rx) = mpsc::unbounded_channel();
+        let (client_one_tx, mut client_one_rx) = mpsc::channel(1);
+        let (client_two_tx, mut client_two_rx) = mpsc::channel(1);
         state.register_client(1, &client_one_tx);
         state.register_client(2, &client_two_tx);
 
@@ -575,11 +972,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_queue_drops_frames_when_full() {
+        let (tap_tx, _tap_rx) = mpsc::unbounded_channel();
+        let state = AppState::new(tap_tx);
+
+        let (client_tx, mut client_rx) = mpsc::channel(1);
+        state.register_client(1, &client_tx);
+
+        let client_mac = MacAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        assert!(state.learn_mac(1, client_mac));
+
+        let first_frame = ethernet_frame_with_payload(
+            client_mac.0,
+            [0x02, 0x00, 0x00, 0x00, 0x00, 0xaa],
+            &[0x01],
+        );
+        let second_frame = ethernet_frame_with_payload(
+            client_mac.0,
+            [0x02, 0x00, 0x00, 0x00, 0x00, 0xaa],
+            &[0x02],
+        );
+
+        handle_tap_frame(&state, first_frame.clone());
+        handle_tap_frame(&state, second_frame);
+
+        assert_eq!(client_rx.try_recv().expect("queued frame"), first_frame);
+        assert!(matches!(client_rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
     async fn learning_same_mac_twice_is_a_noop() {
         let (tap_tx, _tap_rx) = mpsc::unbounded_channel();
         let state = AppState::new(tap_tx);
 
-        let (client_tx, _client_rx) = mpsc::unbounded_channel();
+        let (client_tx, _client_rx) = mpsc::channel(1);
         state.register_client(1, &client_tx);
 
         let mac = MacAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
@@ -591,10 +1017,14 @@ mod tests {
     }
 
     fn ethernet_frame(destination: [u8; 6], source: [u8; 6]) -> Bytes {
+        ethernet_frame_with_payload(destination, source, &[0x08, 0x00])
+    }
+
+    fn ethernet_frame_with_payload(destination: [u8; 6], source: [u8; 6], payload: &[u8]) -> Bytes {
         let mut frame = Vec::with_capacity(14);
         frame.extend_from_slice(&destination);
         frame.extend_from_slice(&source);
-        frame.extend_from_slice(&[0x08, 0x00]);
+        frame.extend_from_slice(payload);
         Bytes::from(frame)
     }
 }
