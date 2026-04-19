@@ -26,12 +26,44 @@ cargo build --release
 
 ```bash
 sudo RUST_LOG=info cargo run --release -- \
-  --listen-addr 0.0.0.0:8080 \
+  --listen-addr 0.0.0.0:80 \
   --tap-name tap0 \
   --tap-mtu 1500
 ```
 
 The WebSocket endpoint is exposed at `/`.
+
+## Metrics (Prometheus)
+
+The server exposes `GET /metrics`, returning Prometheus text metrics for traffic totals and recent throughput.
+
+Prometheus includes a built-in Web UI at port `9090` (Graph, Targets, etc.).
+
+### Run Prometheus with Docker
+
+1. Run the relay on the host (example):
+
+```bash
+sudo RUST_LOG=info cargo run --release -- \
+  --listen-addr 0.0.0.0:80 \
+  --tap-name tap0 \
+  --tap-mtu 1500
+```
+
+2. Start Prometheus (Docker Compose):
+
+```bash
+docker compose up -d
+```
+
+3. Open the Prometheus UI:
+
+- `http://localhost:9090`
+
+Then check `Status -> Targets` and run queries like:
+
+- `websockproxy_current_bytes_per_second`
+- `websockproxy_connected_clients`
 
 ## Bridge helper
 
@@ -42,8 +74,6 @@ sudo ./scripts/bridge-tap.sh
 ./scripts/bridge-tap.sh status
 ./scripts/bridge-tap.sh down
 ```
-
-The server also exposes `GET /traffic`, which returns JSON traffic stats including total bytes and a recent throughput sample.
 
 ## Configuration
 

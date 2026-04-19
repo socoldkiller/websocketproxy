@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use axum::{
-    Json, Router,
+    Router,
     extract::{
         ConnectInfo, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::HeaderMap,
+    http::{HeaderMap, header},
     response::IntoResponse,
     routing::get,
 };
@@ -37,6 +37,7 @@ const CLIENT_OUTBOUND_QUEUE_CAPACITY: usize = 128;
 const CLIENT_OUTBOUND_DRAIN_BATCH_SIZE: usize = 32;
 const TRAFFIC_RECENT_WINDOW_SECS: u64 = 5;
 const TRAFFIC_RECENT_WINDOW_SIZE: usize = 5;
+const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum SessionControl {
@@ -332,6 +333,152 @@ impl TrafficStats {
     }
 }
 
+fn format_traffic_prometheus(snapshot: &TrafficSnapshot) -> String {
+    let mut output = String::with_capacity(1024);
+
+    write_metric(
+        &mut output,
+        "websockproxy_uptime_seconds",
+        "Process uptime in seconds.",
+        "gauge",
+        snapshot.uptime_seconds,
+    );
+    write_metric(
+        &mut output,
+        "websockproxy_recent_window_seconds",
+        "Recent sampling window in seconds.",
+        "gauge",
+        snapshot.recent_window_seconds,
+    );
+    write_metric(
+        &mut output,
+        "websockproxy_connected_clients",
+        "Connected websocket clients.",
+        "gauge",
+        snapshot.connected_clients,
+    );
+    write_metric(
+        &mut output,
+        "websockproxy_current_bytes_per_second",
+        "Recent aggregate traffic rate in bytes per second.",
+        "gauge",
+        snapshot.current_bps,
+    );
+
+    write_direction_metric_family(
+        &mut output,
+        "websockproxy_traffic_direction_frames_total",
+        "Total frames observed per traffic direction.",
+        "counter",
+        [
+            ("websocket_rx", snapshot.websocket_rx.frames),
+            ("websocket_tx", snapshot.websocket_tx.frames),
+            ("tap_rx", snapshot.tap_rx.frames),
+            ("tap_tx", snapshot.tap_tx.frames),
+        ],
+    );
+    write_direction_metric_family(
+        &mut output,
+        "websockproxy_traffic_direction_bytes_total",
+        "Total bytes observed per traffic direction.",
+        "counter",
+        [
+            ("websocket_rx", snapshot.websocket_rx.bytes),
+            ("websocket_tx", snapshot.websocket_tx.bytes),
+            ("tap_rx", snapshot.tap_rx.bytes),
+            ("tap_tx", snapshot.tap_tx.bytes),
+        ],
+    );
+    write_direction_metric_family(
+        &mut output,
+        "websockproxy_traffic_direction_recent_frames",
+        "Frames observed per traffic direction over the recent window.",
+        "gauge",
+        [
+            ("websocket_rx", snapshot.websocket_rx.recent_frames),
+            ("websocket_tx", snapshot.websocket_tx.recent_frames),
+            ("tap_rx", snapshot.tap_rx.recent_frames),
+            ("tap_tx", snapshot.tap_tx.recent_frames),
+        ],
+    );
+    write_direction_metric_family(
+        &mut output,
+        "websockproxy_traffic_direction_recent_bytes",
+        "Bytes observed per traffic direction over the recent window.",
+        "gauge",
+        [
+            ("websocket_rx", snapshot.websocket_rx.recent_bytes),
+            ("websocket_tx", snapshot.websocket_tx.recent_bytes),
+            ("tap_rx", snapshot.tap_rx.recent_bytes),
+            ("tap_tx", snapshot.tap_tx.recent_bytes),
+        ],
+    );
+    write_direction_metric_family(
+        &mut output,
+        "websockproxy_traffic_direction_recent_bytes_per_second",
+        "Recent bytes per second observed per traffic direction.",
+        "gauge",
+        [
+            ("websocket_rx", snapshot.websocket_rx.recent_bps),
+            ("websocket_tx", snapshot.websocket_tx.recent_bps),
+            ("tap_rx", snapshot.tap_rx.recent_bps),
+            ("tap_tx", snapshot.tap_tx.recent_bps),
+        ],
+    );
+
+    output
+}
+
+fn write_metric<T: fmt::Display>(
+    output: &mut String,
+    name: &str,
+    help: &str,
+    kind: &str,
+    value: T,
+) {
+    use std::fmt::Write as _;
+
+    let _ = writeln!(output, "# HELP {name} {help}");
+    let _ = writeln!(output, "# TYPE {name} {kind}");
+    let _ = writeln!(output, "{name} {value}");
+}
+
+fn write_direction_metric_family(
+    output: &mut String,
+    name: &str,
+    help: &str,
+    kind: &str,
+    samples: [(&str, u64); 4],
+) {
+    use std::fmt::Write as _;
+
+    let _ = writeln!(output, "# HELP {name} {help}");
+    let _ = writeln!(output, "# TYPE {name} {kind}");
+
+    for (direction, value) in samples {
+        let _ = writeln!(
+            output,
+            "{name}{{direction=\"{}\"}} {value}",
+            escape_prometheus_label_value(direction)
+        );
+    }
+}
+
+fn escape_prometheus_label_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            _ => escaped.push(ch),
+        }
+    }
+
+    escaped
+}
+
 #[derive(Clone)]
 struct ClientHandle {
     tx: mpsc::Sender<Frame>,
@@ -547,7 +694,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(ws_handler))
-        .route("/traffic", get(traffic_handler))
+        .route("/metrics", get(metrics_handler))
         .with_state(Arc::clone(&state));
 
     let listener = tokio::net::TcpListener::bind(cli.listen_addr)
@@ -583,8 +730,11 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| client_session(socket, state, peer))
 }
 
-async fn traffic_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.traffic_snapshot())
+async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
+        format_traffic_prometheus(&state.traffic_snapshot()),
+    )
 }
 
 async fn run_traffic_task(state: Arc<AppState>) {
@@ -854,7 +1004,8 @@ fn ethernet_addrs(frame: &[u8]) -> Option<(MacAddress, MacAddress)> {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        AppState, MacAddress, TrafficStats, ethernet_addrs, handle_client_frame, handle_tap_frame,
+        AppState, MacAddress, TrafficStats, ethernet_addrs, format_traffic_prometheus,
+        handle_client_frame, handle_tap_frame,
     };
     use bytes::Bytes;
     use tokio::sync::mpsc::{self, error::TryRecvError};
@@ -907,6 +1058,38 @@ mod tests {
         assert_eq!(snapshot.tap_rx.bytes, 10);
         assert_eq!(snapshot.tap_tx.recent_bytes, 25);
         assert_eq!(snapshot.current_bps, 15);
+    }
+
+    #[test]
+    fn traffic_snapshot_renders_prometheus_text() {
+        let stats = TrafficStats::new();
+
+        stats.record_websocket_rx(100);
+        stats.record_websocket_tx_batch(2, 40);
+        stats.record_tap_rx(10);
+        stats.sample_at(1);
+
+        stats.record_websocket_rx(50);
+        stats.record_tap_tx(25);
+        stats.sample_at(6);
+
+        let snapshot = stats.snapshot_at(6, 3);
+        let body = format_traffic_prometheus(&snapshot);
+
+        assert!(body.contains("# HELP websockproxy_uptime_seconds Process uptime in seconds."));
+        assert!(body.contains("# TYPE websockproxy_uptime_seconds gauge"));
+        assert!(body.contains("websockproxy_connected_clients 3"));
+        assert!(body.contains("websockproxy_current_bytes_per_second 15"));
+        assert!(body.contains(
+            "websockproxy_traffic_direction_bytes_total{direction=\"websocket_rx\"} 150"
+        ));
+        assert!(
+            body.contains("websockproxy_traffic_direction_recent_bytes{direction=\"tap_tx\"} 25")
+        );
+        assert!(body.contains(
+            "websockproxy_traffic_direction_recent_bytes_per_second{direction=\"websocket_rx\"} 10"
+        ));
+        assert!(body.ends_with('\n'));
     }
 
     #[tokio::test]
