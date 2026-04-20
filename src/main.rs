@@ -30,6 +30,10 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 use tun::{AbstractDevice, Layer};
 
+mod network;
+
+use crate::network::{NetworkMode, configure_network_mode};
+
 type ClientId = u64;
 type Frame = Bytes;
 type WebSocketSender = futures_util::stream::SplitSink<WebSocket, Message>;
@@ -55,6 +59,18 @@ enum SessionControl {
 struct Cli {
     #[arg(long, env = "LISTEN_ADDR", default_value = "0.0.0.0:80")]
     listen_addr: SocketAddr,
+
+    #[arg(long, env = "NETWORK_MODE", value_enum, default_value_t = NetworkMode::None)]
+    network_mode: NetworkMode,
+
+    #[arg(long, env = "UPLINK_IF")]
+    uplink_if: Option<String>,
+
+    #[arg(long, env = "BRIDGE_NAME", default_value = "br0")]
+    bridge_name: String,
+
+    #[arg(long, env = "NAT_NETWORK", default_value = "10.200.0.0/24")]
+    nat_network: String,
 
     #[arg(long, env = "TAP_NAME", default_value = "tap0")]
     tap_name: String,
@@ -682,6 +698,7 @@ impl fmt::Display for MacAddress {
 async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
+    cli.validate()?;
 
     let (tap_tx, tap_rx) = mpsc::unbounded_channel();
     let state = Arc::new(AppState::new(tap_tx));
@@ -982,10 +999,12 @@ async fn run_tap_task(
 
     let device = tun::create_as_async(&config).context("failed to create TAP device")?;
     let tap_name = device.tun_name().unwrap_or_else(|_| cli.tap_name.clone());
+    configure_network_mode(&cli, &tap_name).await?;
 
     info!(
         tap = %tap_name,
         mtu = cli.tap_mtu,
+        network_mode = %cli.network_mode.as_str(),
         "tap device ready"
     );
 

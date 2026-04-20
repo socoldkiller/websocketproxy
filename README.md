@@ -27,11 +27,43 @@ cargo build --release
 ```bash
 sudo RUST_LOG=info cargo run --release -- \
   --listen-addr 0.0.0.0:80 \
+  --network-mode none \
   --tap-name tap0 \
   --tap-mtu 1500
 ```
 
 The WebSocket endpoint is exposed at `/`.
+
+## Network modes
+
+The relay can configure the host networking for the TAP device with `--network-mode`.
+
+- `none`: create and use the TAP device only. The host networking is left unchanged.
+- `bridge`: create or reuse a Linux bridge, move the uplink IPv4 addresses/default route to it, and attach both the uplink and TAP device.
+- `nat`: assign a gateway address to the TAP device, enable IPv4 forwarding, and install nftables NAT/FORWARD rules directly via netlink for the selected uplink.
+
+Examples:
+
+```bash
+# TAP only
+sudo cargo run --release -- \
+  --network-mode none \
+  --tap-name tap0
+
+# Bridge tap0 into the physical uplink
+sudo cargo run --release -- \
+  --network-mode bridge \
+  --uplink-if enp3s0 \
+  --bridge-name br0 \
+  --tap-name tap0
+
+# NAT clients behind tap0 out through the physical uplink
+sudo cargo run --release -- \
+  --network-mode nat \
+  --uplink-if enp3s0 \
+  --nat-network 10.200.0.0/24 \
+  --tap-name tap0
+```
 
 ## Metrics (Prometheus)
 
@@ -46,6 +78,7 @@ Prometheus includes a built-in Web UI at port `9090` (Graph, Targets, etc.).
 ```bash
 sudo RUST_LOG=info cargo run --release -- \
   --listen-addr 0.0.0.0:80 \
+  --network-mode none \
   --tap-name tap0 \
   --tap-mtu 1500
 ```
@@ -80,6 +113,10 @@ sudo ./scripts/bridge-tap.sh
 | Flag | Environment variable | Default |
 | --- | --- | --- |
 | `--listen-addr` | `LISTEN_ADDR` | `0.0.0.0:80` |
+| `--network-mode` | `NETWORK_MODE` | `none` |
+| `--uplink-if` | `UPLINK_IF` | unset |
+| `--bridge-name` | `BRIDGE_NAME` | `br0` |
+| `--nat-network` | `NAT_NETWORK` | `10.200.0.0/24` |
 | `--tap-name` | `TAP_NAME` | `tap0` |
 | `--tap-mtu` | `TAP_MTU` | `1500` |
 
