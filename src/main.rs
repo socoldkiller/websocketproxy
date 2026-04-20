@@ -63,7 +63,11 @@ struct Cli {
     #[arg(long, env = "NETWORK_MODE", value_enum, default_value_t = NetworkMode::None)]
     network_mode: NetworkMode,
 
-    #[arg(long, env = "UPLINK_IF")]
+    #[arg(
+        long,
+        env = "UPLINK_IF",
+        help = "Override the uplink interface; defaults to the default IPv4 route interface"
+    )]
     uplink_if: Option<String>,
 
     #[arg(long, env = "BRIDGE_NAME", default_value = "br0")]
@@ -876,24 +880,27 @@ fn handle_client_batch_result(
     peer: &str,
 ) -> SessionControl {
     match send_result {
-        Ok(stats) => {
-            record_websocket_tx_batch_if_any(state, stats);
+        Ok(batch_stats) => {
+            record_websocket_tx_batch_if_any(state, batch_stats);
             SessionControl::Continue
         }
-        Err(stats) => {
-            record_websocket_tx_batch_if_any(state, stats);
+        Err(batch_stats) => {
+            record_websocket_tx_batch_if_any(state, batch_stats);
             debug!(client_id, peer = %peer, "client writer stopped");
             SessionControl::Disconnect
         }
     }
 }
 
-fn record_websocket_tx_batch_if_any(state: &AppState, stats: BatchSendStats) {
-    if stats.sent_frames == 0 {
+fn record_websocket_tx_batch_if_any(app_state: &AppState, batch_stats: BatchSendStats) {
+    if batch_stats.sent_frames == 0 {
         return;
     }
 
-    state.record_websocket_tx_batch(stats.sent_frames, saturating_usize_to_u64(stats.sent_bytes));
+    app_state.record_websocket_tx_batch(
+        batch_stats.sent_frames,
+        saturating_usize_to_u64(batch_stats.sent_bytes),
+    );
 }
 
 fn handle_client_message(

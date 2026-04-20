@@ -41,6 +41,7 @@ The relay can configure the host networking for the TAP device with `--network-m
 - `none`: create and use the TAP device only. The host networking is left unchanged.
 - `bridge`: create or reuse a Linux bridge, move the uplink IPv4 addresses/default route to it, and attach both the uplink and TAP device.
 - `nat`: assign a gateway address to the TAP device, enable IPv4 forwarding, and install nftables NAT/FORWARD rules directly via netlink for the selected uplink.
+- If `--uplink-if` is omitted, the relay first uses the interface from the default IPv4 route. If that is unavailable, it falls back to the only physical NIC when exactly one exists.
 
 Examples:
 
@@ -53,14 +54,12 @@ sudo cargo run --release -- \
 # Bridge tap0 into the physical uplink
 sudo cargo run --release -- \
   --network-mode bridge \
-  --uplink-if enp3s0 \
   --bridge-name br0 \
   --tap-name tap0
 
 # NAT clients behind tap0 out through the physical uplink
 sudo cargo run --release -- \
   --network-mode nat \
-  --uplink-if enp3s0 \
   --nat-network 10.200.0.0/24 \
   --tap-name tap0
 ```
@@ -98,23 +97,13 @@ Then check `Status -> Targets` and run queries like:
 - `websockproxy_current_bytes_per_second`
 - `websockproxy_connected_clients`
 
-## Bridge helper
-
-The `scripts/bridge-tap.sh` helper manages a Linux bridge between the uplink interface and the TAP device.
-
-```bash
-sudo ./scripts/bridge-tap.sh
-./scripts/bridge-tap.sh status
-./scripts/bridge-tap.sh down
-```
-
 ## Configuration
 
 | Flag | Environment variable | Default |
 | --- | --- | --- |
 | `--listen-addr` | `LISTEN_ADDR` | `0.0.0.0:80` |
 | `--network-mode` | `NETWORK_MODE` | `none` |
-| `--uplink-if` | `UPLINK_IF` | unset |
+| `--uplink-if` | `UPLINK_IF` | default IPv4 route interface |
 | `--bridge-name` | `BRIDGE_NAME` | `br0` |
 | `--nat-network` | `NAT_NETWORK` | `10.200.0.0/24` |
 | `--tap-name` | `TAP_NAME` | `tap0` |

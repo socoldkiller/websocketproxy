@@ -16,7 +16,7 @@ use std::{fs, net::IpAddr};
 use tracing::info;
 
 #[cfg(target_os = "linux")]
-use super::{link_by_name, new_netlink_handle, set_link_up};
+use super::{link_by_name, new_netlink_handle, resolve_uplink_if, set_link_up};
 
 #[cfg(target_os = "linux")]
 const NAT_FORWARD_CHAIN_NAME: &str = "forward";
@@ -31,14 +31,11 @@ const NAT_TABLE_NAME_PREFIX: &str = "websockproxy_nat_";
 
 #[cfg(target_os = "linux")]
 pub(super) async fn configure_nat_mode(cli: &crate::Cli, tap_name: &str) -> Result<()> {
-    let uplink_if = cli
-        .uplink_if
-        .as_deref()
-        .context("nat mode requires --uplink-if")?;
+    let uplink_if = resolve_uplink_if(cli).await?;
     let nat_subnet = cli.nat_subnet()?;
-    let tap_gateway = nat_gateway(nat_subnet)?;
+    let tap_gateway = nat_gateway(nat_subnet);
     let handle = new_netlink_handle()?;
-    let uplink_link = link_by_name(&handle, uplink_if).await?;
+    let uplink_link = link_by_name(&handle, &uplink_if).await?;
     let tap_link = link_by_name(&handle, tap_name).await?;
 
     handle
@@ -58,7 +55,7 @@ pub(super) async fn configure_nat_mode(cli: &crate::Cli, tap_name: &str) -> Resu
 
     fs::write("/proc/sys/net/ipv4/ip_forward", "1\n")
         .context("failed to enable net.ipv4.ip_forward")?;
-    configure_nat_ruleset(tap_name, uplink_if, nat_subnet)?;
+    configure_nat_ruleset(tap_name, &uplink_if, nat_subnet)?;
 
     let table_name = nat_table_name(tap_name);
 
@@ -75,10 +72,8 @@ pub(super) async fn configure_nat_mode(cli: &crate::Cli, tap_name: &str) -> Resu
     Ok(())
 }
 
-pub(super) fn nat_gateway(subnet: Ipv4Net) -> Result<Ipv4Addr> {
-    Ok(Ipv4Addr::from(
-        u32::from(subnet.network()).saturating_add(1),
-    ))
+pub fn nat_gateway(subnet: Ipv4Net) -> Ipv4Addr {
+    Ipv4Addr::from(u32::from(subnet.network()).saturating_add(1))
 }
 
 #[cfg(target_os = "linux")]
