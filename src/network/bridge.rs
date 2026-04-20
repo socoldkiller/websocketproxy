@@ -18,7 +18,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use tracing::info;
 
 #[cfg(target_os = "linux")]
-use super::{link_by_name, new_netlink_handle};
+use super::{link_by_name, link_by_name_optional, new_netlink_handle};
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Debug)]
@@ -151,24 +151,6 @@ async fn set_link_controller_up(handle: &Handle, index: u32, controller_index: u
         .execute()
         .await?;
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-async fn link_by_name_optional(handle: &Handle, name: &str) -> Result<Option<LinkMessage>> {
-    let mut links = handle.link().get().match_name(name.to_owned()).execute();
-    let link = links
-        .try_next()
-        .await
-        .with_context(|| format!("failed to query interface {name}"))?;
-
-    if link.is_some() {
-        anyhow::ensure!(
-            links.try_next().await?.is_none(),
-            "multiple interfaces named {name}"
-        );
-    }
-
-    Ok(link)
 }
 
 #[cfg(target_os = "linux")]

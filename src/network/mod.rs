@@ -9,7 +9,10 @@ mod nat;
 #[cfg(target_os = "linux")]
 use futures_util::TryStreamExt;
 #[cfg(target_os = "linux")]
-use rtnetlink::{Handle, LinkUnspec, new_connection, packet_route::link::LinkMessage};
+use rtnetlink::{
+    Handle, LinkUnspec, new_connection,
+    packet_route::link::{LinkAttribute, LinkMessage},
+};
 
 #[cfg(target_os = "linux")]
 use self::{bridge::configure_bridge_mode, nat::configure_nat_mode};
@@ -125,21 +128,35 @@ pub(super) async fn link_by_name(handle: &Handle, name: &str) -> Result<LinkMess
 }
 
 #[cfg(target_os = "linux")]
-async fn link_by_name_optional(handle: &Handle, name: &str) -> Result<Option<LinkMessage>> {
-    let mut links = handle.link().get().match_name(name.to_owned()).execute();
-    let link = links
+pub(super) async fn link_by_name_optional(
+    handle: &Handle,
+    name: &str,
+) -> Result<Option<LinkMessage>> {
+    let mut links = handle.link().get().execute();
+    let mut matched = None;
+
+    while let Some(link) = links
         .try_next()
         .await
-        .with_context(|| format!("failed to query interface {name}"))?;
+        .with_context(|| format!("failed to query interface {name}"))?
+    {
+        if !link_has_name(&link, name) {
+            continue;
+        }
 
-    if link.is_some() {
-        anyhow::ensure!(
-            links.try_next().await?.is_none(),
-            "multiple interfaces named {name}"
-        );
+        anyhow::ensure!(matched.is_none(), "multiple interfaces named {name}");
+        matched = Some(link);
     }
 
-    Ok(link)
+    Ok(matched)
+}
+
+#[cfg(target_os = "linux")]
+fn link_has_name(link: &LinkMessage, name: &str) -> bool {
+    link.attributes.iter().any(|attribute| match attribute {
+        LinkAttribute::IfName(link_name) => link_name == name,
+        _ => false,
+    })
 }
 
 #[cfg(test)]
