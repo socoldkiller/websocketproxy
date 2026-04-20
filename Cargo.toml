@@ -1,6 +1,7 @@
 [package]
 name = "websockproxy-relay"
 version = "0.1.0"
+build = "build.rs"
 description = "Rust Layer 2 relay bridging raw Ethernet frames between WebSocket clients and a TAP device"
 edition = "2024"
 repository = "https://github.com/socoldkiller/websocketproxy"

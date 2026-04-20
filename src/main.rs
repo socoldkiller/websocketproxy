@@ -43,6 +43,7 @@ const CLIENT_OUTBOUND_DRAIN_BATCH_SIZE: usize = 32;
 const TRAFFIC_RECENT_WINDOW_SECS: u64 = 5;
 const TRAFFIC_RECENT_WINDOW_SIZE: usize = 5;
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+const BUILD_VERSION: &str = env!("BUILD_VERSION");
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum SessionControl {
@@ -53,7 +54,7 @@ enum SessionControl {
 #[derive(Parser, Debug, Clone)]
 #[command(
     author,
-    version,
+    version = BUILD_VERSION,
     about = "Rust WebSocket Ethernet relay without rate limiting"
 )]
 struct Cli {
@@ -723,7 +724,11 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("failed to bind {}", cli.listen_addr))?;
 
-    info!(listen = %cli.listen_addr, "websocket relay listening");
+    info!(
+        version = %BUILD_VERSION,
+        listen = %cli.listen_addr,
+        "websocket relay listening"
+    );
 
     tokio::select! {
         result = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()) => {

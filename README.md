@@ -18,9 +18,21 @@
 
 ## Build
 
+With Make:
+
+```bash
+make build
+make test
+make release
+```
+
+Or directly with Cargo:
+
 ```bash
 cargo build --release
 ```
+
+`make release` creates a single binary at `dist/websockproxy-relay`.
 
 ## Run
 
@@ -33,6 +45,9 @@ sudo RUST_LOG=info cargo run --release -- \
 ```
 
 The WebSocket endpoint is exposed at `/`.
+`--version` prints the current git tag, or the commit hash if there is no tag on `HEAD`.
+
+GitHub Actions publishes the release binary automatically for tags that match `v*`.
 
 ## Network modes
 
