@@ -32,6 +32,7 @@ use tun::{AbstractDevice, Layer};
 
 type ClientId = u64;
 type Frame = Bytes;
+type WebSocketSender = futures_util::stream::SplitSink<WebSocket, Message>;
 
 const CLIENT_OUTBOUND_QUEUE_CAPACITY: usize = 128;
 const CLIENT_OUTBOUND_DRAIN_BATCH_SIZE: usize = 32;
@@ -759,51 +760,19 @@ fn forwarded_for(headers: &HeaderMap) -> Option<String> {
 
 async fn client_session(socket: WebSocket, state: Arc<AppState>, peer: String) {
     let client_id = state.next_client_id();
-    let (client_tx, mut client_rx) = mpsc::channel(CLIENT_OUTBOUND_QUEUE_CAPACITY);
+    let (client_tx, client_rx) = mpsc::channel(CLIENT_OUTBOUND_QUEUE_CAPACITY);
     state.register_client(client_id, &client_tx);
 
     info!(client_id, peer = %peer, "client connected");
 
-    let (mut ws_sender, mut ws_receiver) = socket.split();
-    let peer_for_writer = peer.clone();
-    let writer_state = Arc::clone(&state);
-    let writer_task = tokio::spawn(async move {
-        let mut batch = Vec::with_capacity(CLIENT_OUTBOUND_DRAIN_BATCH_SIZE);
-
-        while let Some(frame) = client_rx.recv().await {
-            batch.clear();
-            batch.push(frame);
-
-            while batch.len() < CLIENT_OUTBOUND_DRAIN_BATCH_SIZE {
-                match client_rx.try_recv() {
-                    Ok(frame) => batch.push(frame),
-                    Err(
-                        mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected,
-                    ) => break,
-                }
-            }
-
-            let mut sent_frames = 0_u64;
-            let mut sent_bytes = 0_u64;
-
-            for frame in batch.split_off(0) {
-                let frame_len = frame.len();
-                if ws_sender.send(Message::Binary(frame)).await.is_err() {
-                    if sent_frames > 0 {
-                        writer_state.record_websocket_tx_batch(sent_frames, sent_bytes);
-                    }
-                    debug!(client_id, peer = %peer_for_writer, "client writer stopped");
-                    return;
-                }
-                sent_frames = sent_frames.saturating_add(1);
-                sent_bytes = sent_bytes.saturating_add(saturating_usize_to_u64(frame_len));
-            }
-
-            if sent_frames > 0 {
-                writer_state.record_websocket_tx_batch(sent_frames, sent_bytes);
-            }
-        }
-    });
+    let (ws_sender, mut ws_receiver) = socket.split();
+    let writer_task = tokio::spawn(run_client_writer(
+        ws_sender,
+        client_rx,
+        Arc::clone(&state),
+        client_id,
+        peer.clone(),
+    ));
 
     while let Some(message) = ws_receiver.next().await {
         if handle_client_message(&state, client_id, message) == SessionControl::Disconnect {
@@ -814,6 +783,100 @@ async fn client_session(socket: WebSocket, state: Arc<AppState>, peer: String) {
     writer_task.abort();
     state.unregister_client(client_id);
     info!(client_id, peer = %peer, "client disconnected");
+}
+
+async fn run_client_writer(
+    mut ws_sender: WebSocketSender,
+    mut client_rx: mpsc::Receiver<Frame>,
+    state: Arc<AppState>,
+    client_id: ClientId,
+    peer: String,
+) {
+    let mut batch = ClientOutboundBatch::new();
+
+    while receive_client_batch(&mut client_rx, &mut batch).await {
+        let send_result = send_client_batch(&mut ws_sender, &mut batch).await;
+        if handle_client_batch_result(&state, send_result, client_id, &peer)
+            == SessionControl::Disconnect
+        {
+            return;
+        }
+    }
+}
+
+struct ClientOutboundBatch {
+    frames: Vec<Frame>,
+}
+
+impl ClientOutboundBatch {
+    fn new() -> Self {
+        Self {
+            frames: Vec::with_capacity(CLIENT_OUTBOUND_DRAIN_BATCH_SIZE),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct BatchSendStats {
+    sent_frames: u64,
+    sent_bytes: usize,
+}
+
+async fn receive_client_batch(
+    client_rx: &mut mpsc::Receiver<Frame>,
+    batch: &mut ClientOutboundBatch,
+) -> bool {
+    client_rx
+        .recv_many(&mut batch.frames, CLIENT_OUTBOUND_DRAIN_BATCH_SIZE)
+        .await
+        > 0
+}
+
+async fn send_client_batch(
+    ws_sender: &mut WebSocketSender,
+    batch: &mut ClientOutboundBatch,
+) -> Result<BatchSendStats, BatchSendStats> {
+    let mut stats = BatchSendStats::default();
+
+    for frame in batch.frames.drain(..) {
+        let frame_len = frame.len();
+        ws_sender
+            .send(Message::Binary(frame))
+            .await
+            .map_err(|_| stats)?;
+
+        stats.sent_frames = stats.sent_frames.saturating_add(1);
+        stats.sent_bytes = stats.sent_bytes.saturating_add(frame_len);
+    }
+
+    Ok(stats)
+}
+
+fn handle_client_batch_result(
+    state: &AppState,
+    send_result: Result<BatchSendStats, BatchSendStats>,
+    client_id: ClientId,
+    peer: &str,
+) -> SessionControl {
+    match send_result {
+        Ok(stats) => {
+            record_websocket_tx_batch_if_any(state, stats);
+            SessionControl::Continue
+        }
+        Err(stats) => {
+            record_websocket_tx_batch_if_any(state, stats);
+            debug!(client_id, peer = %peer, "client writer stopped");
+            SessionControl::Disconnect
+        }
+    }
+}
+
+fn record_websocket_tx_batch_if_any(state: &AppState, stats: BatchSendStats) {
+    if stats.sent_frames == 0 {
+        return;
+    }
+
+    state.record_websocket_tx_batch(stats.sent_frames, saturating_usize_to_u64(stats.sent_bytes));
 }
 
 fn handle_client_message(
