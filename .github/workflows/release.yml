@@ -19,11 +19,18 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Configure musl linker
+        run: echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld" >> "$GITHUB_ENV"
 
       - name: Run tests
         run: make test
 
       - name: Build release binary
+        env:
+          TARGET_TRIPLE: x86_64-unknown-linux-musl
         run: make release
 
       - name: Upload release assets

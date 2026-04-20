@@ -3,7 +3,8 @@ SHELL := /usr/bin/env bash
 CARGO ?= cargo
 PACKAGE_NAME ?= websockproxy-relay
 DIST_DIR ?= dist
-RELEASE_DIR ?= target/release
+TARGET_TRIPLE ?= $(shell rustc -vV | awk '/^host: / { print $$2 }')
+RELEASE_DIR ?= target/$(TARGET_TRIPLE)/release
 RELEASE_BINARY := $(RELEASE_DIR)/$(PACKAGE_NAME)
 RELEASE_ARTIFACT := $(DIST_DIR)/$(PACKAGE_NAME)
 
@@ -29,7 +30,7 @@ build:
 	$(CARGO) build --locked
 
 build-release:
-	$(CARGO) build --release --locked
+	$(CARGO) build --release --locked --target $(TARGET_TRIPLE)
 
 release: build-release
 	rm -rf $(DIST_DIR)

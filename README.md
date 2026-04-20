@@ -33,6 +33,8 @@ cargo build --release
 ```
 
 `make release` creates a single binary at `dist/websockproxy-relay`.
+GitHub releases are built as a static Linux `musl` binary, so they run on Alpine without glibc.
+To build the same release artifact locally, run `make release TARGET_TRIPLE=x86_64-unknown-linux-musl`.
 
 ## Run
 
