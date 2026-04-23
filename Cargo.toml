@@ -2,11 +2,11 @@
 name = "websockproxy-relay"
 version = "0.1.0"
 build = "build.rs"
-description = "Rust Layer 2 relay bridging raw Ethernet frames between WebSocket clients and a TAP device"
+description = "Rust Layer 2 relay bridging raw Ethernet frames between WebSocket/WebTransport clients and a TAP device"
 edition = "2024"
 repository = "https://github.com/socoldkiller/websocketproxy"
 rust-version = "1.85"
-keywords = ["websocket", "ethernet", "tap", "relay"]
+keywords = ["websocket", "webtransport", "ethernet", "tap", "relay"]
 categories = ["network-programming"]
 
 [lints.rust]
@@ -37,6 +37,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 futures-util = "0.3"
 ipnet = "2.11"
 rtnetlink = "0.18"
+wtransport = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
 tracing = "0.1"

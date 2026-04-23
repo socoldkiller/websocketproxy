@@ -10,7 +10,7 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -19,6 +19,7 @@ use std::{
     convert::TryFrom,
     fmt,
     net::SocketAddr,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -29,6 +30,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 use tun::{AbstractDevice, Layer};
+use wtransport::{
+    Connection as WtConnection, Endpoint as WtEndpoint, Identity as WtIdentity,
+    RecvStream as WtRecvStream, SendStream as WtSendStream, ServerConfig as WtServerConfig,
+};
 
 mod network;
 
@@ -37,9 +42,13 @@ use crate::network::{NetworkMode, configure_network_mode};
 type ClientId = u64;
 type Frame = Bytes;
 type WebSocketSender = futures_util::stream::SplitSink<WebSocket, Message>;
+type WebTransportSendStream = WtSendStream;
+type WebTransportRecvStream = WtRecvStream;
 
 const CLIENT_OUTBOUND_QUEUE_CAPACITY: usize = 128;
 const CLIENT_OUTBOUND_DRAIN_BATCH_SIZE: usize = 32;
+const WEBTRANSPORT_MAX_FRAME_SIZE: usize = 65_535;
+const WEBTRANSPORT_FRAME_HEADER_SIZE: usize = 4;
 const TRAFFIC_RECENT_WINDOW_SECS: u64 = 5;
 const TRAFFIC_RECENT_WINDOW_SIZE: usize = 5;
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
@@ -60,6 +69,18 @@ enum SessionControl {
 struct Cli {
     #[arg(long, env = "LISTEN_ADDR", default_value = "0.0.0.0:80")]
     listen_addr: SocketAddr,
+
+    #[arg(long, env = "WEBTRANSPORT_ADDR", default_value = "0.0.0.0:4433")]
+    webtransport_addr: SocketAddr,
+
+    #[arg(long, env = "WEBTRANSPORT_CERT")]
+    webtransport_cert: Option<PathBuf>,
+
+    #[arg(long, env = "WEBTRANSPORT_KEY")]
+    webtransport_key: Option<PathBuf>,
+
+    #[arg(long, env = "WEBTRANSPORT_SANS", value_delimiter = ',', num_args = 0..)]
+    webtransport_sans: Vec<String>,
 
     #[arg(long, env = "NETWORK_MODE", value_enum, default_value_t = NetworkMode::None)]
     network_mode: NetworkMode,
@@ -712,6 +733,13 @@ async fn main() -> Result<()> {
     let tap_cli = cli.clone();
     let tap_task = tokio::spawn(async move { run_tap_task(tap_cli, tap_state, tap_rx).await });
 
+    let webtransport_state = Arc::clone(&state);
+    let webtransport_cli = cli.clone();
+    let webtransport_task =
+        tokio::spawn(
+            async move { run_webtransport_task(webtransport_cli, webtransport_state).await },
+        );
+
     let traffic_state = Arc::clone(&state);
     let _traffic_task = tokio::spawn(async move { run_traffic_task(traffic_state).await });
 
@@ -736,6 +764,9 @@ async fn main() -> Result<()> {
         }
         result = tap_task => {
             result.context("tap task join error")??;
+        }
+        result = webtransport_task => {
+            result.context("webtransport task join error")??;
         }
     }
 
@@ -926,7 +957,7 @@ fn handle_client_message(
 
 fn handle_client_frame(state: &AppState, client_id: ClientId, frame: Frame) {
     let Some((destination, source)) = ethernet_addrs(&frame) else {
-        warn!(client_id, "dropping short websocket frame");
+        warn!(client_id, "dropping short client frame");
         return;
     };
 
@@ -990,6 +1021,254 @@ fn handle_client_frame(state: &AppState, client_id: ClientId, frame: Frame) {
     if let Err(error) = state.send_to_tap(frame) {
         warn!(client_id, %error, destination = %destination, "failed to forward frame to TAP");
     }
+}
+
+async fn run_webtransport_task(cli: Cli, state: Arc<AppState>) -> Result<()> {
+    let identity = webtransport_identity(&cli).await?;
+    if let Some(certificate_hash) = identity
+        .certificate_chain()
+        .as_ref()
+        .first()
+        .map(|certificate| certificate.hash())
+    {
+        info!(
+            listen = %cli.webtransport_addr,
+            certificate_hash = %certificate_hash,
+            "webtransport identity ready"
+        );
+    }
+
+    let server_config = WtServerConfig::builder()
+        .with_bind_address(cli.webtransport_addr)
+        .with_identity(identity)
+        .build();
+
+    let server =
+        WtEndpoint::server(server_config).context("failed to start webtransport server")?;
+
+    info!(
+        listen = %cli.webtransport_addr,
+        "webtransport relay listening"
+    );
+
+    loop {
+        let incoming_session = server.accept().await;
+        let incoming_request = match incoming_session.await {
+            Ok(request) => request,
+            Err(error) => {
+                warn!(%error, "failed to accept webtransport session");
+                continue;
+            }
+        };
+
+        let connection = match incoming_request.accept().await {
+            Ok(connection) => connection,
+            Err(error) => {
+                warn!(%error, "failed to finalize webtransport session");
+                continue;
+            }
+        };
+
+        let session_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let peer = connection.remote_address().to_string();
+            if let Err(error) =
+                run_webtransport_session(connection, session_state, peer.clone()).await
+            {
+                warn!(peer = %peer, %error, "webtransport session stopped");
+            }
+        });
+    }
+}
+
+async fn webtransport_identity(cli: &Cli) -> Result<WtIdentity> {
+    match (&cli.webtransport_cert, &cli.webtransport_key) {
+        (Some(cert), Some(key)) => WtIdentity::load_pemfiles(cert, key)
+            .await
+            .context("failed to load webtransport TLS identity"),
+        (None, None) => {
+            let sans = webtransport_subject_alt_names(cli);
+            let identity = WtIdentity::self_signed(&sans)
+                .context("failed to generate self-signed webtransport identity")?;
+
+            info!(?sans, "generated self-signed webtransport identity");
+            Ok(identity)
+        }
+        _ => anyhow::bail!("webtransport cert and key must either both be set or both be omitted"),
+    }
+}
+
+fn webtransport_subject_alt_names(cli: &Cli) -> Vec<String> {
+    let mut sans = if cli.webtransport_sans.is_empty() {
+        vec![
+            String::from("localhost"),
+            String::from("127.0.0.1"),
+            String::from("::1"),
+        ]
+    } else {
+        cli.webtransport_sans.clone()
+    };
+
+    let addr = cli.webtransport_addr.ip();
+    if !addr.is_unspecified() {
+        let addr = addr.to_string();
+        if !sans.iter().any(|san| san == &addr) {
+            sans.push(addr);
+        }
+    }
+
+    sans
+}
+
+async fn run_webtransport_session(
+    connection: WtConnection,
+    state: Arc<AppState>,
+    peer: String,
+) -> Result<()> {
+    let client_id = state.next_client_id();
+    let (client_tx, client_rx) = mpsc::channel(CLIENT_OUTBOUND_QUEUE_CAPACITY);
+    state.register_client(client_id, &client_tx);
+
+    info!(client_id, peer = %peer, "webtransport client connected");
+
+    let session_result = async {
+        let (send_stream, mut recv_stream) = connection
+            .accept_bi()
+            .await
+            .context("failed to accept webtransport data stream")?;
+
+        let writer_task = tokio::spawn(run_webtransport_writer(
+            send_stream,
+            client_rx,
+            Arc::clone(&state),
+            client_id,
+            peer.clone(),
+        ));
+
+        let read_result = run_webtransport_reader(&mut recv_stream, &state, client_id).await;
+        writer_task.abort();
+        read_result
+    }
+    .await;
+
+    state.unregister_client(client_id);
+    info!(client_id, peer = %peer, "webtransport client disconnected");
+
+    session_result
+}
+
+async fn run_webtransport_writer(
+    mut send_stream: WebTransportSendStream,
+    mut client_rx: mpsc::Receiver<Frame>,
+    state: Arc<AppState>,
+    client_id: ClientId,
+    peer: String,
+) {
+    let mut batch = ClientOutboundBatch::new();
+
+    while receive_client_batch(&mut client_rx, &mut batch).await {
+        let send_result = send_webtransport_batch(&mut send_stream, &mut batch).await;
+        if handle_client_batch_result(&state, send_result, client_id, &peer)
+            == SessionControl::Disconnect
+        {
+            return;
+        }
+    }
+
+    if let Err(error) = send_stream.finish().await {
+        debug!(client_id, peer = %peer, %error, "webtransport stream finish failed");
+    }
+}
+
+async fn send_webtransport_batch(
+    send_stream: &mut WebTransportSendStream,
+    batch: &mut ClientOutboundBatch,
+) -> Result<BatchSendStats, BatchSendStats> {
+    let mut stats = BatchSendStats::default();
+
+    for frame in batch.frames.drain(..) {
+        let frame_len = frame.len();
+        let encoded_frame = encode_webtransport_frame(&frame);
+        send_stream
+            .write_all(encoded_frame.as_ref())
+            .await
+            .map_err(|_| stats)?;
+
+        stats.sent_frames = stats.sent_frames.saturating_add(1);
+        stats.sent_bytes = stats.sent_bytes.saturating_add(frame_len);
+    }
+
+    Ok(stats)
+}
+
+async fn run_webtransport_reader(
+    recv_stream: &mut WebTransportRecvStream,
+    state: &AppState,
+    client_id: ClientId,
+) -> Result<()> {
+    let mut buffer = BytesMut::new();
+    let mut chunk = [0_u8; 4096];
+
+    while let Some(bytes_read) = recv_stream
+        .read(&mut chunk)
+        .await
+        .context("failed to read webtransport frame")?
+    {
+        if bytes_read == 0 {
+            continue;
+        }
+
+        state.record_websocket_rx(bytes_read);
+        for frame in decode_webtransport_frames(&mut buffer, &chunk[..bytes_read])? {
+            handle_client_frame(state, client_id, frame);
+        }
+    }
+
+    Ok(())
+}
+
+fn encode_webtransport_frame(frame: &Frame) -> Bytes {
+    assert!(
+        frame.len() <= WEBTRANSPORT_MAX_FRAME_SIZE,
+        "webtransport frame too large"
+    );
+
+    let mut encoded = Vec::with_capacity(WEBTRANSPORT_FRAME_HEADER_SIZE + frame.len());
+    encoded.extend_from_slice(
+        &(u32::try_from(frame.len()).expect("frame length fits in u32")).to_le_bytes(),
+    );
+    encoded.extend_from_slice(frame);
+    Bytes::from(encoded)
+}
+
+fn decode_webtransport_frames(buffer: &mut BytesMut, chunk: &[u8]) -> Result<Vec<Frame>> {
+    buffer.extend_from_slice(chunk);
+
+    let mut frames = Vec::new();
+    loop {
+        if buffer.len() < WEBTRANSPORT_FRAME_HEADER_SIZE {
+            break;
+        }
+
+        let len_bytes: [u8; WEBTRANSPORT_FRAME_HEADER_SIZE] = buffer
+            [..WEBTRANSPORT_FRAME_HEADER_SIZE]
+            .try_into()
+            .expect("prefix length");
+        let frame_len = u32::from_le_bytes(len_bytes) as usize;
+
+        if frame_len > WEBTRANSPORT_MAX_FRAME_SIZE {
+            anyhow::bail!("webtransport frame too large: {frame_len}");
+        }
+
+        if buffer.len() < WEBTRANSPORT_FRAME_HEADER_SIZE + frame_len {
+            break;
+        }
+
+        let _ = buffer.split_to(WEBTRANSPORT_FRAME_HEADER_SIZE);
+        frames.push(buffer.split_to(frame_len).freeze());
+    }
+
+    Ok(frames)
 }
 
 async fn run_tap_task(
@@ -1098,10 +1377,10 @@ fn ethernet_addrs(frame: &[u8]) -> Option<(MacAddress, MacAddress)> {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        AppState, MacAddress, TrafficStats, ethernet_addrs, format_traffic_prometheus,
-        handle_client_frame, handle_tap_frame,
+        AppState, MacAddress, TrafficStats, decode_webtransport_frames, encode_webtransport_frame,
+        ethernet_addrs, format_traffic_prometheus, handle_client_frame, handle_tap_frame,
     };
-    use bytes::Bytes;
+    use bytes::{Bytes, BytesMut};
     use tokio::sync::mpsc::{self, error::TryRecvError};
 
     #[test]
@@ -1291,6 +1570,36 @@ mod tests {
 
         let (client_id, _sender) = state.sender_for_mac(mac).expect("mac mapping");
         assert_eq!(client_id, 1);
+    }
+
+    #[test]
+    fn webtransport_frame_round_trip() {
+        let frame = Bytes::from_static(b"hello ethernet");
+        let encoded = encode_webtransport_frame(&frame);
+        let mut buffer = BytesMut::new();
+
+        let frames = decode_webtransport_frames(&mut buffer, &encoded).expect("decode");
+        assert_eq!(frames, vec![frame]);
+    }
+
+    #[test]
+    fn webtransport_frame_decoder_handles_fragmentation() {
+        let frame_one = Bytes::from_static(b"first");
+        let frame_two = Bytes::from_static(b"second");
+        let encoded_one = encode_webtransport_frame(&frame_one);
+        let encoded_two = encode_webtransport_frame(&frame_two);
+        let split = encoded_one.len() / 2;
+
+        let mut buffer = BytesMut::new();
+        let mut frames =
+            decode_webtransport_frames(&mut buffer, &encoded_one[..split]).expect("first");
+        assert!(frames.is_empty());
+
+        frames = decode_webtransport_frames(&mut buffer, &encoded_one[split..]).expect("second");
+        assert_eq!(frames, vec![frame_one]);
+
+        frames = decode_webtransport_frames(&mut buffer, &encoded_two).expect("third");
+        assert_eq!(frames, vec![frame_two]);
     }
 
     fn ethernet_frame(destination: [u8; 6], source: [u8; 6]) -> Bytes {

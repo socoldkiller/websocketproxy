@@ -46,6 +46,13 @@ impl crate::Cli {
             let _ = self.nat_subnet()?;
         }
 
+        let cert = self.webtransport_cert.is_some();
+        let key = self.webtransport_key.is_some();
+        anyhow::ensure!(
+            cert == key,
+            "webtransport cert and key must either both be set or both be omitted"
+        );
+
         Ok(())
     }
 

@@ -1,0 +1,15 @@
+#!/sbin/openrc-run
+
+description="websockproxy-relay"
+
+: "${WEBSOCKPROXY_BIN:=/usr/local/bin/websockproxy-relay}"
+: "${WEBSOCKPROXY_ARGS:=--listen-addr 0.0.0.0:80 --network-mode none --tap-name tap0 --tap-mtu 1500}"
+
+command="${WEBSOCKPROXY_BIN}"
+command_args="${WEBSOCKPROXY_ARGS}"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+
+depend() {
+    need net
+}

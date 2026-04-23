@@ -1,13 +1,14 @@
 # websocketproxy
 
-`websockproxy-relay` is a Rust Layer 2 relay that carries raw Ethernet frames over WebSocket and bridges them with a local TAP device.
+`websockproxy-relay` is a Rust Layer 2 relay that carries raw Ethernet frames over WebSocket or WebTransport and bridges them with a local TAP device.
 
 ## What it does
 
 - Accepts WebSocket connections on `/`
+- Accepts WebTransport sessions on the configured UDP/TLS listener
 - Learns client source MAC addresses and forwards unicast traffic to the known destination
 - Floods broadcast, multicast, and unknown unicast frames to other clients
-- Bridges traffic between connected WebSocket clients and a local TAP interface
+- Bridges traffic between connected clients and a local TAP interface
 - Supports CLI flags and environment variables for runtime configuration
 
 ## Requirements
@@ -15,6 +16,7 @@
 - Rust 1.85 or newer
 - A system that supports TAP devices
 - Sufficient privileges to create and bring up a TAP interface
+- For WebTransport, a TLS certificate is required; the server can generate a self-signed certificate or load PEM files
 
 ## Build
 
@@ -41,12 +43,14 @@ To build the same release artifact locally, run `make release TARGET_TRIPLE=x86_
 ```bash
 sudo RUST_LOG=info cargo run --release -- \
   --listen-addr 0.0.0.0:80 \
+  --webtransport-addr 0.0.0.0:4433 \
   --network-mode none \
   --tap-name tap0 \
   --tap-mtu 1500
 ```
 
 The WebSocket endpoint is exposed at `/`.
+The WebTransport listener uses `https://` over the configured UDP port and logs the certificate hash when a self-signed certificate is generated.
 `--version` prints the current git tag, or the commit hash if there is no tag on `HEAD`.
 
 GitHub Actions publishes the release binary automatically for tags that match `v*`.
@@ -113,6 +117,19 @@ Then check `Status -> Targets` and run queries like:
 
 - `websockproxy_current_bytes_per_second`
 - `websockproxy_connected_clients`
+
+## OpenRC (Alpine)
+
+Install the static binary and service files:
+
+```bash
+sudo make install-openrc TARGET_TRIPLE=x86_64-unknown-linux-musl
+sudo rc-update add websockproxy-relay default
+sudo rc-service websockproxy-relay start
+```
+
+Edit `/etc/conf.d/websockproxy-relay` to switch between `none`, `bridge`, or `nat`.
+The service runs as root and depends on `net`.
 
 ## Configuration
 

@@ -1,0 +1,15 @@
+# /etc/conf.d/websockproxy-relay
+#
+# Edit WEBSOCKPROXY_ARGS to match your topology.
+#
+# TAP only:
+# WEBSOCKPROXY_ARGS="--listen-addr 0.0.0.0:80 --network-mode none --tap-name tap0 --tap-mtu 1500"
+#
+# Bridge mode:
+# WEBSOCKPROXY_ARGS="--listen-addr 0.0.0.0:80 --network-mode bridge --bridge-name br0 --tap-name tap0 --uplink-if enp3s0"
+#
+# NAT mode:
+# WEBSOCKPROXY_ARGS="--listen-addr 0.0.0.0:80 --network-mode nat --tap-name tap0 --uplink-if enp3s0 --nat-network 10.200.0.0/24"
+
+WEBSOCKPROXY_BIN="/usr/local/bin/websockproxy-relay"
+WEBSOCKPROXY_ARGS="--listen-addr 0.0.0.0:80 --network-mode none --tap-name tap0 --tap-mtu 1500"
