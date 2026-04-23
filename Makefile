@@ -7,11 +7,16 @@ TARGET_TRIPLE ?= $(shell rustc -vV | awk '/^host: / { print $$2 }')
 RELEASE_DIR ?= target/$(TARGET_TRIPLE)/release
 RELEASE_BINARY := $(RELEASE_DIR)/$(PACKAGE_NAME)
 RELEASE_ARTIFACT := $(DIST_DIR)/$(PACKAGE_NAME)
+TARGET_TRIPLE_ENV := $(subst -,_,$(TARGET_TRIPLE))
 OPENRC_DIR ?= openrc
 OPENRC_SERVICE_NAME ?= websockproxy-relay
 OPENRC_BIN_DIR ?= /usr/local/bin
 OPENRC_INITD_DIR ?= /etc/init.d
 OPENRC_CONFD_DIR ?= /etc/conf.d
+
+ifeq ($(TARGET_TRIPLE),x86_64-unknown-linux-musl)
+RELEASE_CC_ENV := CC_$(TARGET_TRIPLE_ENV)=clang CFLAGS_$(TARGET_TRIPLE_ENV)=--target=$(TARGET_TRIPLE)
+endif
 
 .PHONY: help fmt test build build-release release install-openrc clean
 
@@ -36,7 +41,7 @@ build:
 	$(CARGO) build --locked
 
 build-release:
-	$(CARGO) build --release --locked --target $(TARGET_TRIPLE)
+	$(RELEASE_CC_ENV) $(CARGO) build --release --locked --target $(TARGET_TRIPLE)
 
 release: build-release
 	rm -rf $(DIST_DIR)
